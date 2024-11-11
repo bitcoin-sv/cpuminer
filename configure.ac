@@ -120,13 +120,43 @@ else
 	JANSSON_LIBS=-ljansson
 fi
 
-LIBCURL_CHECK_CONFIG(, 7.15.2, ,
-  [AC_MSG_ERROR([Missing required libcurl >= 7.15.2])])
+# Minimum version of libcurl required
+LIBCURL_MINIMUM_VERSION="7.15.2"
+
+# Locate curl-config
+AC_PATH_PROG([CURL_CONFIG], [curl-config], [no])
+
+# Check if curl-config was found
+if test "x$CURL_CONFIG" = "xno"; then
+  AC_MSG_ERROR([curl-config script not found. Please install libcurl.])
+fi
+
+# Get the version of libcurl
+LIBCURL_VERSION=$($CURL_CONFIG --version | cut -d' ' -f2)
+
+# Compare the version of libcurl with the minimum required version
+AC_MSG_CHECKING([for libcurl >= $LIBCURL_MINIMUM_VERSION])
+AS_VERSION_COMPARE([$LIBCURL_VERSION], [$LIBCURL_MINIMUM_VERSION],
+  [AC_MSG_RESULT([yes])],
+  [AC_MSG_ERROR([libcurl version $LIBCURL_VERSION is too old. Minimum required is $LIBCURL_MINIMUM_VERSION])])
+
+# Get flags for compiling and linking with libcurl
+LIBCURL_CPPFLAGS="$($CURL_CONFIG --cflags)"
+LIBCURL_LIBS="$($CURL_CONFIG --libs)"
+
+# Substitute @LIBCURL_CPPFLAGS@ and @LIBCURL_LIBS@
+AC_SUBST([LIBCURL_CPPFLAGS])
+AC_SUBST([LIBCURL_LIBS])
 
 AC_SUBST(JANSSON_LIBS)
 AC_SUBST(PTHREAD_FLAGS)
 AC_SUBST(PTHREAD_LIBS)
 AC_SUBST(WS2_LIBS)
+
+# Replace any existing curl check with this:
+AC_CHECK_LIB([curl], [curl_easy_init], [LIBCURL="-lcurl"], 
+    [AC_MSG_ERROR([Missing required libcurl])])
+AC_SUBST([LIBCURL])
 
 AC_CONFIG_FILES([
 	Makefile
