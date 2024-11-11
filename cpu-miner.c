@@ -424,6 +424,8 @@ static bool gbt_work_decode(const json_t *val, struct work *work) {
   json_t *tmp, *txa;
   bool rc = false;
 
+  applog(LOG_DEBUG, "GBT: height %d", json_integer_value(json_object_get(val, "height")));
+
   tmp = json_object_get(val, "rules");
   if (tmp && json_is_array(tmp)) {
     n = json_array_size(tmp);
@@ -973,6 +975,7 @@ start:
         applog(LOG_DEBUG,
                "getminingcandidate failed, falling back to getblocktemplate");
       have_gmc = false;
+      want_gmc = false;
     }
   }
 
