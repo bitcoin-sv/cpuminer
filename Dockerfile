@@ -60,7 +60,7 @@ RUN             apt-get update -qq && \
                     libcurl4-openssl-dev \
                     make && \
                 rm -rf /var/lib/apt/lists/* && \
-                git clone https://github.com/pooler/cpuminer && \
+                git clone https://github.com/bitcoin-sv/cpuminer && \
                 cd cpuminer && \
                 ./autogen.sh && \
                 ./configure CFLAGS="-O3" && \
