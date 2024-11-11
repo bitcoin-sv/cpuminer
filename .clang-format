@@ -1,0 +1,4 @@
+Language: Cpp
+BasedOnStyle: Google  # or any other preferred style
+BraceWrapping:
+  AfterControlStatement: true
