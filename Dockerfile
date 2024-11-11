@@ -4,8 +4,14 @@
 # docker build -t image_name:tag .
 # ex: docker build -t cpuminer:1.0 .
 #
-# usage: docker run image_name:tag --url xxxx --user xxxx --pass xxxx
-# ex: docker run cpuminer:1.0 --url stratum+tcp://bsv.svpool.com:3333 -a sha256d --user worker.1 --pass abcdef --debug
+# usage:
+#  docker run image_name:tag -a sha256d -o http://<bitcoin host>:<port> -O <rpcuser>:<rpcpass> --coinbase-addr=<address>
+#  docker run image_name:tag --url xxxx --user xxxx --pass xxxx
+#
+# ex (direct):  docker run cpuminer:1.0 -a sha256d -o http://host.docker.internal:18332 -O bitcoin:bitcoin --coinbase-addr=mpXwg4jMtRhuSpVq4xS3HFHmCmWp9NyGKt
+#
+# ex (stratum): docker run cpuminer:1.0 --url stratum+tcp://bsv.svpool.com:3333 -a sha256d --user worker.1 --pass abcdef
+
 #
 # Usage: minerd [OPTIONS]
 #Options:
