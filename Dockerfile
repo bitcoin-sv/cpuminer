@@ -37,6 +37,7 @@
 #      --no-longpoll     disable long polling support
 #      --no-getwork      disable getwork support
 #      --no-gbt          disable getblocktemplate support
+#      --no-gmc          disable getminingcandidate support
 #      --no-stratum      disable X-Stratum support
 #      --no-redirect     ignore requests to change the URL of the mining server
 #  -q, --quiet           disable per-thread hashmeter output

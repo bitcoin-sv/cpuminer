@@ -189,6 +189,7 @@ Options:\n\
       --coinbase-sig=TEXT  data to insert in the coinbase when possible\n\
       --no-longpoll     disable long polling support\n\
       --no-getwork      disable getwork support\n\
+			--no-gmc          disable getminingcandidate support\n\
       --no-gbt          disable getblocktemplate support\n\
       --no-stratum      disable X-Stratum support\n\
       --no-redirect     ignore requests to change the URL of the mining server\n\
@@ -231,6 +232,7 @@ static struct option const options[] = {
 	{ "config", 1, NULL, 'c' },
 	{ "debug", 0, NULL, 'D' },
 	{ "help", 0, NULL, 'h' },
+	{ "no-gmc", 0, NULL, 1012 },
 	{ "no-gbt", 0, NULL, 1011 },
 	{ "no-getwork", 0, NULL, 1010 },
 	{ "no-longpoll", 0, NULL, 1003 },
@@ -266,6 +268,19 @@ struct work {
 	char *job_id;
 	size_t xnonce2_len;
 	unsigned char *xnonce2;
+};
+
+struct mining_candidate {
+    uint32_t version;
+    uint32_t height;
+		uint32_t num_tx;
+		uint32_t sizeWithoutCoinbase;
+    char prevhash[65];
+    uint32_t nBits;
+    uint32_t nTime; // "time"
+    char *merkleProof;
+    char *coinbaseValue;
+    char *id;
 };
 
 static struct work g_work;
@@ -831,6 +846,8 @@ static const char *gbt_req =
 static const char *gbt_lp_req =
 	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
 	GBT_CAPABILITIES ", \"rules\": " GBT_RULES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
+static const char *gmc_req =
+	"{\"method\": \"getminingcandidate\", \"params\": [], \"id\":0}\r\n";
 
 static bool get_upstream_work(CURL *curl, struct work *work)
 {
@@ -841,10 +858,6 @@ static bool get_upstream_work(CURL *curl, struct work *work)
 
 start:
 	gettimeofday(&tv_start, NULL);
-	val = json_rpc_call(curl, rpc_url, rpc_userpass,
-			    have_gbt ? gbt_req : getwork_req,
-			    &err, have_gbt ? JSON_RPC_QUIET_404 : 0);
-	gettimeofday(&tv_end, NULL);
 
 	if (have_stratum) {
 		if (val)
@@ -852,40 +865,56 @@ start:
 		return true;
 	}
 
-	if (!have_gbt && !allow_getwork) {
-		applog(LOG_ERR, "No usable protocol");
-		if (val)
+	// Try getminingcandidate first if enabled
+	if (want_gmc && !have_stratum) {
+		val = json_rpc_call(curl, rpc_url, rpc_userpass, gmc_req, &err, 
+						   JSON_RPC_QUIET_404);
+		if (val) {
+			have_gmc = true;
+			rc = gmc_work_decode(json_object_get(val, "result"), work);
 			json_decref(val);
-		return false;
+			if (rc)
+				return true;
+			// If GMC decode fails, fall through to try GBT
+		} else if (err != CURLE_OK) {
+			if (opt_debug)
+				applog(LOG_DEBUG, "getminingcandidate failed, falling back to getblocktemplate");
+			have_gmc = false;
+		}
 	}
 
-	if (have_gbt && allow_getwork && !val && err == CURLE_OK) {
-		applog(LOG_INFO, "getblocktemplate failed, falling back to getwork");
-		have_gbt = false;
-		goto start;
-	}
-
-	if (!val)
-		return false;
-
-	if (have_gbt) {
+	// Try getblocktemplate if GMC failed or is disabled
+	if (!have_gmc && have_gbt) {
+		val = json_rpc_call(curl, rpc_url, rpc_userpass, gbt_req, &err,
+						   JSON_RPC_QUIET_404);
+		if (!val) {
+			if (err == CURLE_OK) {
+				if (opt_debug)
+					applog(LOG_DEBUG, "getblocktemplate failed, falling back to getwork");
+				have_gbt = false;
+				goto start;
+			}
+			return false;
+		}
 		rc = gbt_work_decode(json_object_get(val, "result"), work);
+		json_decref(val);
 		if (!have_gbt) {
-			json_decref(val);
 			goto start;
 		}
-	} else
-		rc = work_decode(json_object_get(val, "result"), work);
-
-	if (opt_debug && rc) {
-		timeval_subtract(&diff, &tv_end, &tv_start);
-		applog(LOG_DEBUG, "DEBUG: got new work in %d ms",
-		       diff.tv_sec * 1000 + diff.tv_usec / 1000);
+		return rc;
 	}
 
-	json_decref(val);
+	// Fall back to getwork if everything else failed
+	if (!have_gmc && !have_gbt && allow_getwork) {
+		val = json_rpc_call(curl, rpc_url, rpc_userpass, getwork_req, &err, 0);
+		if (!val)
+			return false;
+		rc = work_decode(json_object_get(val, "result"), work);
+		json_decref(val);
+		return rc;
+	}
 
-	return rc;
+	return false;
 }
 
 static void workio_cmd_free(struct workio_cmd *wc)
@@ -895,9 +924,9 @@ static void workio_cmd_free(struct workio_cmd *wc)
 
 	switch (wc->cmd) {
 	case WC_SUBMIT_WORK:
-		work_free(wc->u.work);
-		free(wc->u.work);
-		break;
+			work_free(wc->u.work);
+			free(wc->u.work);
+			break;
 	default: /* do nothing */
 		break;
 	}
@@ -1759,6 +1788,11 @@ static void parse_arg(int key, char *arg, char *pname)
 	case 1011:
 		have_gbt = false;
 		break;
+	case 1012:  // Add this case
+		have_gmc = false;
+		want_gmc = false;
+		break;
+
 	case 1013:			/* --coinbase-addr */
 		pk_script_size = address_to_script(pk_script, sizeof(pk_script), arg);
 		if (!pk_script_size) {
@@ -1861,6 +1895,174 @@ static void signal_handler(int sig)
 	}
 }
 #endif
+
+// Add these function prototypes after the existing ones
+
+static bool get_mining_candidate(CURL *curl, struct work *work);
+static bool submit_mining_solution(CURL *curl, const struct work *work);
+
+// Add this new function to handle getminingcandidate
+
+static bool get_mining_candidate(CURL *curl, struct work *work)
+{
+    json_t *val;
+    bool rc = false;
+    struct mining_candidate cand = {0};
+    
+    val = json_rpc_call(curl, rpc_url, rpc_userpass,
+                "{\"method\": \"getminingcandidate\", \"params\": [], \"id\":1}\r\n",
+                NULL, 0);
+    if (!val)
+        goto out;
+
+    json_t *result = json_object_get(val, "result");
+    if (!result)
+        goto out;
+
+    // Parse required fields
+    const char *prevhash = json_string_value(json_object_get(result, "prevhash"));
+    if (!prevhash || strlen(prevhash) != 64)
+        goto out;
+    strcpy(cand.prevhash, prevhash);
+
+    cand.version = json_integer_value(json_object_get(result, "version"));
+    cand.height = json_integer_value(json_object_get(result, "height")); 
+    cand.nBits = json_integer_value(json_object_get(result, "nBits"));
+    cand.nTime = json_integer_value(json_object_get(result, "nTime"));
+    
+    const char *id = json_string_value(json_object_get(result, "id"));
+    if (!id)
+        goto out;
+    cand.id = strdup(id);
+
+    // Convert candidate to work
+    work->height = cand.height;
+    work->data[0] = swab32(cand.version);
+    
+    // Convert prevhash hex to bytes and store in work data
+    for (int i = 0; i < 8; i++) {
+        char tmp[9];
+        strncpy(tmp, prevhash + i*8, 8);
+        tmp[8] = '\0';
+        uint32_t v = strtoul(tmp, NULL, 16);
+        work->data[8-i] = le32dec(&v);
+    }
+
+    work->data[17] = swab32(cand.nTime);
+    work->data[18] = le32dec(&cand.nBits);
+    
+    // Set remaining fields
+    memset(work->data + 19, 0x00, 52);
+    work->data[20] = 0x80000000;
+    work->data[31] = 0x00000280;
+
+    // Store mining candidate ID for submission
+    work->workid = cand.id;
+
+    rc = true;
+
+out:
+    if (val)
+        json_decref(val);
+    return rc;
+}
+
+// Add this new function to handle submitminingsolution
+
+static bool submit_mining_solution(CURL *curl, const struct work *work)
+{
+    char *hex;
+    json_t *val;
+    char s[345];
+    bool rc = false;
+    
+    // Convert nonce to hex
+    hex = bin2hex((unsigned char *)(&work->data[19]), 4);
+    
+    // Build submission JSON
+    snprintf(s, sizeof(s),
+            "{\"method\": \"submitminingsolution\", \"params\": [{\"id\": \"%s\", \"nonce\": \"%s\"}], \"id\":1}\r\n",
+            work->workid, hex);
+    free(hex);
+
+    // Submit solution
+    val = json_rpc_call(curl, rpc_url, rpc_userpass, s, NULL, 0);
+    if (!val)
+        goto out;
+
+    rc = json_is_true(json_object_get(val, "result"));
+    
+    if (!rc) {
+        json_t *err = json_object_get(val, "error");
+        const char *reason = err ? json_string_value(json_object_get(err, "message")) : NULL;
+        share_result(rc, reason);
+    } else {
+        share_result(rc, NULL);
+    }
+
+out:
+    if (val)
+        json_decref(val);
+    return rc;
+}
+
+// Add new function to decode GMC response
+static bool gmc_work_decode(const json_t *val, struct work *work)
+{
+    if (!val)
+        return false;
+
+    // Get required fields
+    const char *prevhash = json_string_value(json_object_get(val, "prevhash"));
+    json_t *version_val = json_object_get(val, "version");
+    json_t *nBits_val = json_object_get(val, "nBits");
+    json_t *nTime_val = json_object_get(val, "nTime");
+    json_t *height_val = json_object_get(val, "height");
+    const char *id = json_string_value(json_object_get(val, "id"));
+
+    if (!prevhash || !version_val || !nBits_val || !nTime_val || !height_val || !id) {
+        applog(LOG_ERR, "JSON invalid mining candidate");
+        return false;
+    }
+
+    // Store height and id
+    work->height = json_integer_value(height_val);
+    work->workid = strdup(id);
+
+    // Convert version
+    uint32_t version = json_integer_value(version_val);
+    work->data[0] = swab32(version);
+
+    // Convert prevhash
+    if (strlen(prevhash) != 64) {
+        applog(LOG_ERR, "Invalid prevhash length");
+        return false;
+    }
+    for (int i = 0; i < 8; i++) {
+        char tmp[9];
+        strncpy(tmp, prevhash + i*8, 8);
+        tmp[8] = '\0';
+        uint32_t v = strtoul(tmp, NULL, 16);
+        work->data[8-i] = le32dec(&v);
+    }
+
+    // Set remaining header fields
+    work->data[17] = swab32(json_integer_value(nTime_val));
+    work->data[18] = le32dec(&json_integer_value(nBits_val));
+    
+    // Set padding
+    memset(work->data + 19, 0x00, 52);
+    work->data[20] = 0x80000000;
+    work->data[31] = 0x00000280;
+
+    // Set target based on nBits
+    uint32_t nbits = json_integer_value(nBits_val);
+    for (int i = 0; i < 8; i++)
+        work->target[7-i] = 0;
+    work->target[7] = le32dec(&nbits);
+
+    return true;
+}
 
 int main(int argc, char *argv[])
 {
