@@ -11,6 +11,7 @@ Makefile.in
 INSTALL
 aclocal.m4
 configure
+configure~
 configure.lineno
 depcomp
 missing

@@ -292,11 +292,13 @@ static bool gmc_work_decode(const json_t *val, struct work *work)
     if (!val)
         return false;
 
+		applog(LOG_DEBUG, "GMC: %s", json_dumps(val, 0));
+
     // Get required fields
     const char *prevhash = json_string_value(json_object_get(val, "prevhash"));
     json_t *version_val = json_object_get(val, "version");
     json_t *nBits_val = json_object_get(val, "nBits");
-    json_t *nTime_val = json_object_get(val, "nTime");
+    json_t *nTime_val = json_object_get(val, "time");
     json_t *height_val = json_object_get(val, "height");
     const char *id = json_string_value(json_object_get(val, "id"));
 
@@ -786,24 +788,35 @@ static bool submit_mining_solution(CURL *curl, const struct work *work)
 {
     char *hex;
     json_t *val;
-    char s[345];
+    char s[512];
     bool rc = false;
     
-    // Fix bin2hex call by adding buffer parameter
+    // Convert nonce to hex string
     char nonce_hex[9];  // 4 bytes = 8 hex chars + null terminator
     bin2hex(nonce_hex, (unsigned char *)(&work->data[19]), 4);
-    hex = strdup(nonce_hex);  // Allocate memory for the hex string
     
-    // Rest of the function remains the same
+    // Convert time to hex string
+    char time_hex[9];
+    bin2hex(time_hex, (unsigned char *)(&work->data[17]), 4);
+    uint32_t nTime = swab32(work->data[17]);
+    
+    // Get version
+    uint32_t version = swab32(work->data[0]);
+    
+    // Format JSON request with all fields
     snprintf(s, sizeof(s),
-            "{\"method\": \"submitminingsolution\", \"params\": [{\"id\": \"%s\", \"nonce\": \"%s\"}], \"id\":1}\r\n",
-            work->workid, hex);
-    free(hex);
+            "{\"method\": \"submitminingsolution\", \"params\": [{\"id\": \"%s\", "
+            "\"nonce\": \"%s\", \"time\": %u, \"version\": %u}], \"id\":1}\r\n",
+            work->workid, nonce_hex, nTime, version);
+
+    applog(LOG_DEBUG, "Submitting solution: %s", s);
 
     // Submit solution
     val = json_rpc_call(curl, rpc_url, rpc_userpass, s, NULL, 0);
-    if (!val)
+    if (!val) {
+        applog(LOG_ERR, "Submit solution failed");
         goto out;
+    }
 
     rc = json_is_true(json_object_get(val, "result"));
     
