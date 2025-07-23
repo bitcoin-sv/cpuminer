@@ -264,6 +264,9 @@ struct work {
     char *txs;
     char *workid;
 
+    size_t cbtx_size;
+    char* cbtx;
+
     char *job_id;
     size_t xnonce2_len;
     unsigned char *xnonce2;
@@ -279,6 +282,7 @@ static inline void work_free(struct work *w)
 {
     free(w->txs);
     free(w->workid);
+    free(w->cbtx);
     free(w->job_id);
     free(w->xnonce2);
 }
@@ -290,6 +294,10 @@ static inline void work_copy(struct work *dest, const struct work *src)
         dest->txs = strdup(src->txs);
     if (src->workid)
         dest->workid = strdup(src->workid);
+    if (src->cbtx) {
+        dest->cbtx = malloc(src->cbtx_size);
+        memcpy(dest->cbtx, src->cbtx, src->cbtx_size);
+    }
     if (src->job_id)
         dest->job_id = strdup(src->job_id);
     if (src->xnonce2) {
@@ -318,6 +326,59 @@ static bool jobj_binary(const json_t *obj, const char *key,
         return false;
 
     return true;
+}
+
+static int make_coinbase_txn(unsigned char* cbtx, int64_t cbvalue, struct work* work, bool segwit)
+{
+    le32enc((uint32_t *)cbtx, 1); /* version */
+    cbtx[4] = 1; /* in-counter */
+    memset(cbtx+5, 0x00, 32); /* prev txout hash */
+    le32enc((uint32_t *)(cbtx+37), 0xffffffff); /* prev txout index */
+    int cbtx_size = 43;
+    /* BIP 34: height in coinbase */
+    if (work->height >= 1 && work->height <= 16) {
+        /* Use OP_1-OP_16 to conform to Bitcoin's implementation. */
+        cbtx[42] = work->height + 0x50;
+        cbtx[cbtx_size++] = 0x00; /* OP_0; pads to 2 bytes */
+    }
+    else {
+        for (int n = work->height; n; n >>= 8) {
+            cbtx[cbtx_size++] = n & 0xff;
+            if (n < 0x100 && n >= 0x80)
+                cbtx[cbtx_size++] = 0;
+        }
+        cbtx[42] = cbtx_size - 43;
+    }
+    cbtx[41] = cbtx_size - 42; /* scriptsig length */
+    le32enc((uint32_t *)(cbtx+cbtx_size), 0xffffffff); /* sequence */
+    cbtx_size += 4;
+    cbtx[cbtx_size++] = segwit ? 2 : 1; /* out-counter */
+    le32enc((uint32_t *)(cbtx+cbtx_size), (uint32_t)cbvalue); /* value */
+    le32enc((uint32_t *)(cbtx+cbtx_size+4), cbvalue >> 32);
+    cbtx_size += 8;
+    cbtx[cbtx_size++] = pk_script_size; /* txout-script length */
+    memcpy(cbtx+cbtx_size, pk_script, pk_script_size);
+    cbtx_size += pk_script_size;
+
+    return cbtx_size;
+}
+
+static int append_coinbase_sig(unsigned char* cbtx, int cbtx_size, unsigned char* xsig, int xsig_len)
+{
+    unsigned char* ssig_end = cbtx + 42 + cbtx[41];
+    int push_len = cbtx[41] + xsig_len < 76 ? 1 :
+                   cbtx[41] + 2 + xsig_len > 100 ? 0 : 2;
+    int n = xsig_len + push_len;
+    memmove(ssig_end + n, ssig_end, cbtx_size - 42 - cbtx[41]);
+    cbtx[41] += n;
+    if (push_len == 2)
+        *(ssig_end++) = 0x4c; /* OP_PUSHDATA1 */
+    if (push_len)
+        *(ssig_end++) = xsig_len;
+    memcpy(ssig_end, xsig, xsig_len);
+    cbtx_size += n;
+
+    return cbtx_size;
 }
 
 static bool work_decode(const json_t *val, struct work *work)
@@ -354,6 +415,7 @@ static bool gmc_work_decode(const json_t* val, struct work* work)
     unsigned char *cbtx = NULL;
 
     work->txs = 0;
+    work->cbtx = 0;
     work->workid = 0;
     work->job_id = 0;
     work->xnonce2 = 0;
@@ -389,18 +451,50 @@ static bool gmc_work_decode(const json_t* val, struct work* work)
         goto out;
     }
 
+    /* coinbase transaction */
     tmp = json_object_get(val, "coinbase");
-    if (!tmp) {
-        applog(LOG_ERR, "JSON GMC invalid coinbase");
-        goto out;
+    if (tmp) {
+        const char *cbtx_hex = json_string_value(tmp);
+        cbtx_size = cbtx_hex ? strlen(cbtx_hex) / 2 : 0;
+        cbtx = malloc(cbtx_size + 100);
+        if (cbtx_size < 60 || !hex2bin(cbtx, cbtx_hex, cbtx_size)) {
+            applog(LOG_ERR, "JSON GMC invalid coinbase txn");
+            goto out;
+        }
     }
-    const char *cbtx_hex = json_string_value(tmp);
-    cbtx_size = cbtx_hex ? strlen(cbtx_hex) / 2 : 0;
-    cbtx = malloc(cbtx_size + 100);
-    if (cbtx_size < 60 || !hex2bin(cbtx, cbtx_hex, cbtx_size)) {
-        applog(LOG_ERR, "JSON GMC invalid coinbase txn");
-        goto out;
+    else {
+        if (!pk_script_size) {
+            applog(LOG_ERR, "No payout address provided");
+            goto out;
+        }
+        tmp = json_object_get(val, "coinbaseValue");
+        if (!tmp || !json_is_number(tmp)) {
+            applog(LOG_ERR, "JSON invalid coinbaseValue");
+            goto out;
+        }
+        int64_t cbvalue = json_is_integer(tmp) ? json_integer_value(tmp) : json_number_value(tmp);
+        cbtx = malloc(256);
+        cbtx_size = make_coinbase_txn(cbtx, cbvalue, work, false);
+        le32enc((uint32_t *)(cbtx+cbtx_size), 0); /* lock time */
+        cbtx_size += 4;
+
+        /* additional coinbase signature data */
+        if (*coinbase_sig) {
+            int xsig_len = strlen(coinbase_sig);
+            if (cbtx[41] + xsig_len <= 100) {
+                unsigned char xsig[100];
+                memcpy(xsig, coinbase_sig, xsig_len);
+                cbtx_size = append_coinbase_sig(cbtx, cbtx_size, xsig, xsig_len);
+            }
+            else {
+                applog(LOG_WARNING, "Signature does not fit in coinbase, skipping");
+            }
+        }
     }
+    free(work->cbtx);
+    work->cbtx = malloc(cbtx_size);
+    memcpy(work->cbtx, cbtx, cbtx_size);
+    work->cbtx_size = cbtx_size;
 
     tmp = json_object_get(val, "id");
     if (!tmp || !json_is_string(tmp)) {
@@ -596,34 +690,7 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
         }
         cbvalue = json_is_integer(tmp) ? json_integer_value(tmp) : json_number_value(tmp);
         cbtx = malloc(256);
-        le32enc((uint32_t *)cbtx, 1); /* version */
-        cbtx[4] = 1; /* in-counter */
-        memset(cbtx+5, 0x00, 32); /* prev txout hash */
-        le32enc((uint32_t *)(cbtx+37), 0xffffffff); /* prev txout index */
-        cbtx_size = 43;
-        /* BIP 34: height in coinbase */
-        if (work->height >= 1 && work->height <= 16) {
-            /* Use OP_1-OP_16 to conform to Bitcoin's implementation. */
-            cbtx[42] = work->height + 0x50;
-            cbtx[cbtx_size++] = 0x00; /* OP_0; pads to 2 bytes */
-        } else {
-            for (n = work->height; n; n >>= 8) {
-                cbtx[cbtx_size++] = n & 0xff;
-                if (n < 0x100 && n >= 0x80)
-                    cbtx[cbtx_size++] = 0;
-            }
-            cbtx[42] = cbtx_size - 43;
-        }
-        cbtx[41] = cbtx_size - 42; /* scriptsig length */
-        le32enc((uint32_t *)(cbtx+cbtx_size), 0xffffffff); /* sequence */
-        cbtx_size += 4;
-        cbtx[cbtx_size++] = segwit ? 2 : 1; /* out-counter */
-        le32enc((uint32_t *)(cbtx+cbtx_size), (uint32_t)cbvalue); /* value */
-        le32enc((uint32_t *)(cbtx+cbtx_size+4), cbvalue >> 32);
-        cbtx_size += 8;
-        cbtx[cbtx_size++] = pk_script_size; /* txout-script length */
-        memcpy(cbtx+cbtx_size, pk_script, pk_script_size);
-        cbtx_size += pk_script_size;
+        cbtx_size = make_coinbase_txn(cbtx, cbvalue, work, segwit);
         if (segwit) {
             unsigned char (*wtree)[32] = calloc(tx_count + 2, 32);
             memset(cbtx+cbtx_size, 0, 8); /* value */
@@ -693,18 +760,7 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
             }
         }
         if (xsig_len) {
-            unsigned char *ssig_end = cbtx + 42 + cbtx[41];
-            int push_len = cbtx[41] + xsig_len < 76 ? 1 :
-                           cbtx[41] + 2 + xsig_len > 100 ? 0 : 2;
-            n = xsig_len + push_len;
-            memmove(ssig_end + n, ssig_end, cbtx_size - 42 - cbtx[41]);
-            cbtx[41] += n;
-            if (push_len == 2)
-                *(ssig_end++) = 0x4c; /* OP_PUSHDATA1 */
-            if (push_len)
-                *(ssig_end++) = xsig_len;
-            memcpy(ssig_end, xsig, xsig_len);
-            cbtx_size += n;
+            cbtx_size = append_coinbase_sig(cbtx, cbtx_size, xsig, xsig_len);
         }
     }
 
@@ -877,11 +933,14 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
     else if(have_gmc) {
         uint32_t nonce;
         be32enc(&nonce, work->data[19]);
-        sprintf(s,
-            "{\"method\": \"submitminingsolution\", \"params\": [ {\"id\":\"%s\", \"nonce\":%d} ], \"id\":1}\r\n",
-            work->workid, nonce);
+        char* coinbasestr = abin2hex(work->cbtx, work->cbtx_size);
+        char submit[256 + strlen(work->workid) + strlen(coinbasestr)];
+        sprintf(submit,
+            "{\"method\": \"submitminingsolution\", \"params\": [ {\"id\":\"%s\", \"nonce\":%u, \"coinbase\":\"%s\"} ], \"id\":1}\r\n",
+            work->workid, nonce, coinbasestr);
+        free(coinbasestr);
 
-        val = json_rpc_call(curl, rpc_url, rpc_userpass, s, NULL, 0);
+        val = json_rpc_call(curl, rpc_url, rpc_userpass, submit, NULL, 0);
         if (unlikely(!val)) {
             applog(LOG_ERR, "submit_upstream_work json_rpc_call failed");
             goto out;
@@ -997,8 +1056,8 @@ static const char *gbt_lp_req =
     "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
     GBT_CAPABILITIES ", \"rules\": " GBT_RULES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
 
-static const char* gmc_req =
-    "{\"method\": \"getminingcandidate\", \"params\": [true]}\r\n";
+static const char* gmc_req_coinbase = "{\"method\": \"getminingcandidate\", \"params\": [true]}\r\n";
+static const char* gmc_req_no_coinbase = "{\"method\": \"getminingcandidate\", \"params\": []}\r\n";
 
 static bool get_upstream_work(CURL *curl, struct work *work)
 {
@@ -1011,7 +1070,12 @@ start:
     gettimeofday(&tv_start, NULL);
 
     if(have_gmc) {
-        val = json_rpc_call(curl, rpc_url, rpc_userpass, gmc_req, &err, JSON_RPC_QUIET_404);
+        if(pk_script_size) {
+            val = json_rpc_call(curl, rpc_url, rpc_userpass, gmc_req_no_coinbase, &err, JSON_RPC_QUIET_404);
+        }
+        else {
+            val = json_rpc_call(curl, rpc_url, rpc_userpass, gmc_req_coinbase, &err, JSON_RPC_QUIET_404);
+        }
     }
     else if(have_gbt) {
         val = json_rpc_call(curl, rpc_url, rpc_userpass, gbt_req, &err, JSON_RPC_QUIET_404);
