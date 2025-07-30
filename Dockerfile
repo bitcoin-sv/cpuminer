@@ -5,18 +5,17 @@
 #
 #
 
-FROM            ubuntu:16.04
+FROM            ubuntu:24.04
 MAINTAINER      Guillaume J. Charmes <guillaume@charmes.net>
 
 RUN             apt-get update -qq && \
-                apt-get install -qqy automake libcurl4-openssl-dev git make gcc
+                apt-get install -qqy automake libcurl4-openssl-dev make gcc
 
-RUN             git clone https://github.com/pooler/cpuminer
+WORKDIR         /cpuminer
+COPY            . .
 
-RUN             cd cpuminer && \
-                ./autogen.sh && \
+RUN             ./autogen.sh && \
                 ./configure CFLAGS="-O3" && \
                 make
 
-WORKDIR         /cpuminer
 ENTRYPOINT      ["./minerd"]
