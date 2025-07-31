@@ -121,6 +121,7 @@ bool have_gmc = true;
 bool allow_getwork = false;
 bool want_stratum = true;
 bool have_stratum = false;
+bool always_gmc = false;
 bool use_syslog = false;
 static bool opt_background = false;
 static bool opt_quiet = false;
@@ -193,6 +194,7 @@ Options:\n\
       --no-gbt          disable getblocktemplate support\n\
       --no-stratum      disable X-Stratum support\n\
       --no-redirect     ignore requests to change the URL of the mining server\n\
+      --always-gmc      always use getminingcandidate protocol (no fallback to any other RPC)\n\
   -q, --quiet           disable per-thread hashmeter output\n\
   -D, --debug           enable debug output\n\
   -P, --protocol-dump   verbose dump of protocol-level activities\n"
@@ -237,6 +239,7 @@ static struct option const options[] = {
     { "no-longpoll", 0, NULL, 1003 },
     { "no-redirect", 0, NULL, 1009 },
     { "no-stratum", 0, NULL, 1007 },
+    { "always-gmc", 0, NULL, 1008 },
     { "pass", 1, NULL, 'p' },
     { "protocol-dump", 0, NULL, 'P' },
     { "proxy", 1, NULL, 'x' },
@@ -678,7 +681,9 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
             if (allow_getwork) {
                 applog(LOG_INFO, "No payout address provided, switching to getwork");
                 have_gbt = false;
-                have_gmc = false;
+                if(!always_gmc) {
+                    have_gmc = false;
+                }
             } else
                 applog(LOG_ERR, "No payout address provided");
             goto out;
@@ -1101,14 +1106,17 @@ start:
 
     if(!val && err == CURLE_OK) {
         if(have_gmc) {
-            have_gmc = false;
-            if(have_gbt) {
-                applog(LOG_INFO, "getminingcandidate failed, falling back to getblocktemplate");
-                goto start;
-            }
-            else if(allow_getwork) {
-                applog(LOG_INFO, "getminingcandidate failed, falling back to getwork");
-                goto start;
+            applog(LOG_INFO, "getminingcandidate failed");
+            if(!always_gmc) {
+                have_gmc = false;
+                if(have_gbt) {
+                    applog(LOG_INFO, "falling back to getblocktemplate");
+                    goto start;
+                }
+                else if(allow_getwork) {
+                    applog(LOG_INFO, "falling back to getwork");
+                    goto start;
+                }
             }
         }
         else if (have_gbt) {
@@ -2009,6 +2017,9 @@ static void parse_arg(int key, char *arg, char *pname)
         break;
     case 1007:
         want_stratum = false;
+        break;
+    case 1008:
+        always_gmc = true;
         break;
     case 1009:
         opt_redirect = false;
